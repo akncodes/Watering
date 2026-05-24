@@ -1,49 +1,115 @@
 /**
- * ESP32 Smart IoT Node Client Firmware (Global Cloud Upgrade)
+ * ESP32 Smart IoT Node Controller Firmware
  * 
  * Target Board: ESP32 Dev Module (or any standard ESP32 board)
  * Features:
  *  - Connects to Wi-Fi.
- *  - Acts as an HTTP Client polling your central Next.js server.
- *  - Supports secure HTTPS (Vercel deployments) by using WiFiClientSecure with SSL bypass.
- *  - Reports actual physical relay status (?esp32=true&actual=ON/OFF).
- *  - Fetches the desired state and updates GPIO2 instantly.
- *  - Uses non-blocking polling timer (millis()) to keep loops active.
+ *  - Controls standard Relay or Built-in LED on GPIO2 (active-high).
+ *  - Serves HTTP endpoints (/on, /off, /status) returning plain text.
+ *  - Serves wildcard CORS headers to prevent browser-level fetch blocks.
+ *  - Outputs setup details and actions to the Serial Monitor at 115200 baud.
  */
 
 #include <WiFi.h>
-#include <HTTPClient.h>
-#include <WiFiClientSecure.h>
+#include <WebServer.h>
 
-// =========================================================================
-// 1. WI-FI CREDENTIALS - UPDATE THESE FOR YOUR NETWORK
-// =========================================================================
+// ==========================================
+// WIFI CREDENTIALS - UPDATE THESE FOR YOUR NETWORK
+// ==========================================
 const char* ssid = "YOUR_WIFI_SSID";
 const char* password = "YOUR_WIFI_PASSWORD";
 
-// =========================================================================
-// 2. CENTRAL HOST ROUTE - UPDATE THIS TO MATCH YOUR DEPLOYED NEXT.JS APP
-// =========================================================================
-// - For Local testing inside LAN: Use your laptop's private LAN IP (e.g. "http://192.168.29.80:3000/api/control")
-// - For Production anywhere: Use your public Vercel domain (e.g. "https://my-esp32-dashboard.vercel.app/api/control")
-const char* serverUrl = "https://your-deployed-app.vercel.app/api/control";
+// Create WebServer listening on standard port 80
+WebServer server(80);
 
-// Control Pin: GPIO2 (Standard Built-in Blue LED or Relay signal input pin)
+// Control Pin: GPIO2 (Standard Built-in Blue LED on most ESP32 Dev Boards)
+// Connect an active-high relay signal pin here to control a physical mains load.
 const int relayPin = 2;
 
-// Track device state in local memory
+// Track device state in memory
 bool lightStatus = false;
 
-// Polling configuration: Poll the cloud API every 2 seconds
-unsigned long lastPollTime = 0;
-const unsigned long pollInterval = 2000;
+/**
+ * Common helper to inject CORS headers and send response.
+ * This completely avoids browser security blocks.
+ */
+void sendResponse(int statusCode, const String& contentType, const String& content) {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "*");
+  server.send(statusCode, contentType, content);
+}
+
+/**
+ * Handle root URL GET request
+ */
+void handleRoot() {
+  String msg = "ESP32 IoT Node Active.\n";
+  msg += "Available endpoints:\n";
+  msg += " - GET /on     -> Turn relay ON\n";
+  msg += " - GET /off    -> Turn relay OFF\n";
+  msg += " - GET /status -> Check status (ON/OFF)\n";
+  sendResponse(200, "text/plain", msg);
+}
+
+/**
+ * Route: GET /on
+ * Turns the relay pin HIGH (ON) and responds to client.
+ */
+void handleOn() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  digitalWrite(relayPin, HIGH);
+  lightStatus = true;
+  Serial.println("ACTION: GPIO2 turned HIGH (ON)");
+  server.send(200, "text/plain", "ON");
+}
+
+/**
+ * Route: GET /off
+ * Turns the relay pin LOW (OFF) and responds to client.
+ */
+void handleOff() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  digitalWrite(relayPin, LOW);
+  lightStatus = false;
+  Serial.println("ACTION: GPIO2 turned LOW (OFF)");
+  server.send(200, "text/plain", "OFF");
+}
+
+/**
+ * Route: GET /status
+ * Returns current status as raw plain text: "ON" or "OFF"
+ */
+void handleStatus() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  Serial.print("POLL: Status requested. Hardware is ");
+  Serial.println(lightStatus ? "ON" : "OFF");
+  
+  if (lightStatus) {
+    server.send(200, "text/plain", "ON");
+  } else {
+    server.send(200, "text/plain", "OFF");
+  }
+}
+
+/**
+ * Route: OPTIONS / (Pre-flight CORS requests)
+ * Browsers sometimes perform pre-flight OPTIONS checks before fetching.
+ * Responding 204 No Content with CORS headers prevents preflight errors.
+ */
+void handleOptions() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "*");
+  server.send(204);
+}
 
 void setup() {
   // Initialize Serial interface for debugging
   Serial.begin(115200);
   delay(10);
   Serial.println("\n==================================");
-  Serial.println("ESP32 Smart IoT Node Client Booting...");
+  Serial.println("ESP32 Smart IoT Node Booting...");
   
   // Set relay pin as Output and set it to low initially (Safe default)
   pinMode(relayPin, OUTPUT);
@@ -72,84 +138,27 @@ void setup() {
   Serial.print("IP Address assigned: ");
   Serial.println(WiFi.localIP());
   Serial.println("==================================");
-  Serial.println("Firmware in CLIENT mode. Beginning global cloud sync.");
+
+  // Setup Web Server Endpoints
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/on", HTTP_GET, handleOn);
+  server.on("/off", HTTP_GET, handleOff);
+  server.on("/status", HTTP_GET, handleStatus);
+  
+  // Handle CORS Preflights
+  server.on("/on", HTTP_OPTIONS, handleOptions);
+  server.on("/off", HTTP_OPTIONS, handleOptions);
+  server.on("/status", HTTP_OPTIONS, handleOptions);
+
+  // Start HTTP daemon
+  server.begin();
+  Serial.println("HTTP Web Server running on Port 80");
+  Serial.println("Ready to process incoming commands.");
   Serial.println("==================================");
 }
 
 void loop() {
-  // Check if it's time to poll
-  if (millis() - lastPollTime >= pollInterval) {
-    lastPollTime = millis();
-    
-    // Check Wi-Fi Link Health before launching request
-    if (WiFi.status() == WL_CONNECTED) {
-      
-      // We use WiFiClientSecure to process secure HTTPS requests (like Vercel URLs)
-      WiFiClientSecure client;
-      
-      // Bypasses SSL certificate authority validation checks. 
-      // This is necessary because root SSL certificates expire frequently and ESP32 
-      // has limited clock storage to validate SSL certificates out-of-the-box.
-      client.setInsecure(); 
-      
-      HTTPClient http;
-      
-      // Structure the endpoint query string
-      // ?esp32=true marks this call as a micro-controller poll (updates heartbeat)
-      // &actual=ON/OFF reports the current state back to the dashboard console
-      String url = String(serverUrl) + "?esp32=true&actual=" + (lightStatus ? "ON" : "OFF");
-      
-      Serial.print("[CLOUD] Polling Relay... URL: ");
-      Serial.println(url);
-      
-      // Connect to server
-      if (http.begin(client, url)) {
-        // Send HTTP GET request
-        int httpCode = http.GET();
-        
-        if (httpCode > 0) {
-          Serial.printf("[CLOUD] Response HTTP Code: %d\n", httpCode);
-          
-          if (httpCode == HTTP_CODE_OK) {
-            String payload = http.getString();
-            payload.trim();
-            payload.toUpperCase();
-            
-            Serial.print("[CLOUD] Desired State Command: ");
-            Serial.println(payload);
-            
-            // Align physical state to what the server requested
-            if (payload == "ON") {
-              digitalWrite(relayPin, HIGH);
-              if (!lightStatus) {
-                lightStatus = true;
-                Serial.println("[ACTION] Relay physically switched ON");
-              }
-            } else if (payload == "OFF") {
-              digitalWrite(relayPin, LOW);
-              if (lightStatus) {
-                lightStatus = false;
-                Serial.println("[ACTION] Relay physically switched OFF");
-              }
-            }
-          }
-        } else {
-          Serial.printf("[CLOUD] HTTP Request Failed. Error: %s\n", http.errorToString(httpCode).c_str());
-        }
-        
-        // Terminate HTTP transaction
-        http.end();
-      } else {
-        Serial.println("[CLOUD] Error: Unable to open HTTP connection.");
-      }
-      
-    } else {
-      Serial.println("[WIFI] Warning: Connection lost. Re-establishing link...");
-      WiFi.disconnect();
-      WiFi.reconnect();
-    }
-  }
-  
-  // short yield delay for ESP32 operating system core background tasks
-  delay(10);
+  // Run background client loop to poll HTTP requests
+  server.handleClient();
+  delay(2); // Short delay to yield CPU slice to Wi-Fi core stack
 }

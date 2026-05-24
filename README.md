@@ -1,29 +1,10 @@
-# Next.js + ESP32 Smart IoT Node Controller (Dual-Mode Edition)
+# Next.js + ESP32 Smart IoT Node Controller
 
-A high-fidelity, modern IoT dashboard and micro-controller pair that enables real-time physical relay control and live status updates over both **Local Wi-Fi (LAN)** and **Global Internet (WAN)** from anywhere in the world!
+A high-fidelity, modern IoT dashboard and micro-controller pair that enables real-time physical relay control and live status updates over Wi-Fi.
 
----
-
-## 📂 Project Architecture
-
-This project supports two interchangeable connection modes that can be toggled instantly from the dashboard UI:
-
-### 1. Local LAN Mode (Direct Connection)
-- **Concept**: The Next.js dashboard talks directly to the ESP32's private IP.
-- **ESP32 Role**: Operates as a local HTTP Web Server.
-- **Limitation**: Phone/Laptop and ESP32 **must** be on the same Wi-Fi network.
-
-### 2. Global Cloud WAN Mode (Control from Anywhere)
-- **Concept**: Next.js serves as an in-memory **Cloud HTTP Relay** (`/api/control`).
-- **ESP32 Role**: Operates as an **HTTP Client** polling the Next.js Cloud API every 2 seconds.
-- **Advantage**: Control your hardware from **anywhere in the world** (e.g. over cellular data) with zero port forwarding, CGNAT bypasses, or third-party databases!
-
-```
-[ Next.js Dashboard ] (Anywhere in the world)
-         │
-         ▼ (POST /api/control)
-[ Next.js Cloud API / Server ] <─── (GET /api/control?actual=OFF) ─── [ ESP32 Client ] (At Home)
-```
+This project is divided into two primary parts:
+1. **Frontend Dashboard**: Built using Next.js 15+, React 19, and Tailwind CSS v4, featuring a glassmorphic user interface, auto-polling every 2 seconds, live debugging console, and a simulated demo mode.
+2. **Firmware Core**: Built in Arduino C++ for the ESP32 platform, exposing a CORS-compliant RESTful Web Server interface.
 
 ---
 
@@ -32,25 +13,24 @@ This project supports two interchangeable connection modes that can be toggled i
 ```
 esp32-control/
 ├── app/
-│   ├── api/
-│   │   └── control/
-│   │       └── route.ts      # Cloud Relay API Endpoint (GET/POST/OPTIONS)
 │   ├── globals.css          # Tailwind CSS imports & base styles
 │   ├── layout.tsx           # Dashboard layout shell with Geist fonts
-│   └── page.tsx             # Main dual-mode client dashboard UI
+│   └── page.tsx             # Main client dashboard UI (State, Poller, Logs, Config)
 ├── esp32/
-│   └── esp32.ino            # ESP32 C++ HTTP Client sketch with HTTPS/SSL bypass
+│   └── esp32.ino            # ESP32 C++ HTTP Server sketch for Arduino IDE
+├── public/                  # Next.js static asset public directory
 ├── package.json             # Workspace dependencies & build scripts
 ├── tsconfig.json            # Strict TypeScript configuration
-└── README.md                # This comprehensive assembly guide
+└── README.md                # This comprehensive guide
 ```
 
 ---
 
 ## 🔌 Hardware Connection Diagram
 
-To control physical electronics (like a lamp or relay module) safely, connect the ESP32 using the following pin schema:
+To control standard household appliances safely, connect the ESP32 to a **5V Active-High Relay Module** using the following pin schema:
 
+### Schematic Diagram
 ```
   ┌────────────────────────┐                  ┌────────────────────────┐
   │      ESP32 Board       │                  │  5V Relay Module Card  │
@@ -67,78 +47,88 @@ To control physical electronics (like a lamp or relay module) safely, connect th
 ```
 
 > [!WARNING]
-> **Safety First:** Working with high voltage AC mains power (110V/220V) can be dangerous. Turn off circuit breakers before handling mains wiring. For zero-risk testing, simply use the **ESP32's on-board blue LED (hardwired to GPIO2)** which will mirror the relay state!
+> **Safety First:** Working with high voltage AC mains power (110V/220V) can be extremely dangerous. Always turn off circuit breakers before handling mains wiring. If you are just testing, you can use the **ESP32's on-board blue LED (hardwired to GPIO2)** instead of connecting a physical relay.
 
 ---
 
 ## 🛠️ ESP32 Firmware Installation
 
-Upload the firmware using the **Arduino IDE**:
+Follow these steps to upload the firmware using **Arduino IDE**:
 
-### 1. Configure Board manager
+### 1. Configure Arduino IDE
+- Download and install [Arduino IDE](https://www.arduino.cc/en/software).
 - Open **File** -> **Preferences**.
 - In **Additional Boards Manager URLs**, paste:
   `https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json`
 - Open **Tools** -> **Board** -> **Boards Manager...**, search for `esp32` by *Espressif Systems*, and click **Install**.
 
-### 2. Configure the Firmware Code
+### 2. Prepare the Code
 - Open [esp32/esp32.ino](file:///c:/Users/imabh/OneDrive/Documents/esp32-control/esp32/esp32.ino) in Arduino IDE.
-- Locate the Wi-Fi credentials section and input your router details:
+- Locate the Wi-Fi credentials section at the top:
   ```cpp
   const char* ssid = "YOUR_WIFI_SSID";
   const char* password = "YOUR_WIFI_PASSWORD";
   ```
-- Locate the **`serverUrl`** variable:
-  ```cpp
-  const char* serverUrl = "https://your-deployed-app.vercel.app/api/control";
-  ```
-  - **For local LAN-mode testing**: Set this to your laptop's private network IP, e.g., `http://192.168.29.80:3000/api/control` (find your laptop's IP using `ipconfig` in CMD).
-  - **For global anywhere-control**: Set this to your public Next.js deployment URL once deployed to Vercel (e.g. `https://esp32-node.vercel.app/api/control`).
+- Edit these values to match your local 2.4GHz Wi-Fi credentials.
 
-### 3. Flash the Board
-- Connect the ESP32 to your computer.
-- Select your board model in **Tools** -> **Board** (e.g., **ESP32 Dev Module**) and your active COM **Port**.
-- Open the **Serial Monitor** (**Tools** -> **Serial Monitor**) and set it to **115200** baud.
-- Click the **Upload** button (right-arrow icon). If the upload stalls, hold down the physical **BOOT/EN** button on the ESP32.
+### 3. Flash the ESP32
+- Connect your ESP32 board to your computer using a data-grade Micro-USB or USB-C cable.
+- Go to **Tools** -> **Board** and select your board model (e.g., **ESP32 Dev Module**).
+- Go to **Tools** -> **Port** and select the active COM port assigned to the board.
+- Open the **Serial Monitor** (**Tools** -> **Serial Monitor**) and set the baud rate to **115200**.
+- Click the **Upload** button (right-arrow icon) at the top left.
+  *Note: If the upload hangs at "Connecting...", press and hold the **BOOT (EN)** button on the ESP32 board until the flashing process starts.*
 
----
-
-## 🌐 Deploying the Next.js Frontend to Vercel (100% Free)
-
-To control your ESP32 from another city, deploy the Next.js repository to the cloud:
-
-1. **Push your code to GitHub**:
-   - Create a private repository on [GitHub](https://github.com).
-   - Push this `esp32-control` codebase to your repository.
-2. **Deploy on Vercel**:
-   - Go to [Vercel](https://vercel.com) and sign up/login with GitHub.
-   - Click **Add New** -> **Project**.
-   - Import your `esp32-control` repository.
-   - Click **Deploy**. Vercel will bundle and compile your application in 30 seconds!
-3. **Link Your Domain**:
-   - Copy the public deployment URL assigned by Vercel (e.g., `https://esp32-control-alpha.vercel.app`).
-   - Paste this URL into the `serverUrl` variable of your Arduino IDE `esp32.ino` sketch (adding `/api/control` at the end) and flash it!
+### 4. Note the Assigned IP
+- Once flashing completes, the ESP32 will boot and connect to Wi-Fi.
+- Watch the Serial Monitor output. Once connected, it will print:
+  `IP Address assigned: 192.168.1.XX` (e.g., `192.168.1.5`).
+- Copy this IP address.
 
 ---
 
-## 💻 Running & Testing Locally
+## 💻 Running the Next.js Frontend Locally
 
-You can run both LAN and WAN models locally on your home network:
+Once the ESP32 is running on your local network, start the web interface:
 
 ### 1. Install Node.js Dependencies
-Run at the project root folder:
+Run this in your terminal at the project root folder:
 ```bash
 npm install
 ```
 
-### 2. Start the Local Server
+### 2. Start the Development Server
+Execute the Next.js development server:
 ```bash
 npm run dev
 ```
 
-### 3. Open the Dashboard
-- Navigate to [http://localhost:3000](http://localhost:3000).
-- Toggle **Local LAN** vs. **Cloud WAN** directly from the top-right header!
-- **Local LAN Mode**: Click the Gear icon, input your ESP32's local IP address (e.g., `192.168.29.75`), and click Apply.
-- **Cloud WAN Mode**: The dashboard will talk to the server endpoint `/api/control` automatically.
-- **Simulate Mode**: Check this box to instantly test all animations, neon glowing cards, toggles, and micro-second logs without needing physical hardware connected!
+### 3. Access and Configure
+- Open your browser and navigate to [http://localhost:3000](http://localhost:3000).
+- You will see the glowing, glassmorphic dashboard!
+- Since your ESP32 IP address may vary:
+  1. Click the **Gear (Settings)** icon in the top-right corner.
+  2. Input your ESP32's assigned IP (e.g., `192.168.1.15`) in the field.
+  3. Click **Apply & Test**.
+- The page will automatically persist this IP address in your browser's `localStorage` and begin polling its status every 2 seconds.
+- You can toggle the **Demo / Simulate Mode** switch in the top bar to test all UI animations, glows, and log flows immediately without physical hardware connected!
+
+---
+
+## ⚡ REST API Integration Details
+
+The ESP32 firmware hosts these simple text-based REST endpoints:
+
+- **`GET /on`**
+  - **Action**: Sets GPIO2 HIGH.
+  - **Response**: `ON` (plain text) with header `Access-Control-Allow-Origin: *`.
+- **`GET /off`**
+  - **Action**: Sets GPIO2 LOW.
+  - **Response**: `OFF` (plain text) with header `Access-Control-Allow-Origin: *`.
+- **`GET /status`**
+  - **Action**: Queries physical state of GPIO2.
+  - **Response**: `ON` or `OFF` (plain text) with header `Access-Control-Allow-Origin: *`.
+- **`OPTIONS /*`** (Preflight)
+  - **Action**: Intercepts preflight checks.
+  - **Response**: `204 No Content` with CORS headers (`Access-Control-Allow-Methods`, `Access-Control-Allow-Headers`).
+# Watering
