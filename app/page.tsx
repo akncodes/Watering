@@ -10,10 +10,17 @@ interface SystemLog {
   message: string;
 }
 
+type ConnectionMode = 'LAN' | 'CLOUD';
+
 export default function Home() {
   // Config state
+  const [connectionMode, setConnectionMode] = useState<ConnectionMode>('LAN');
   const [ipAddress, setIpAddress] = useState<string>('192.168.29.75');
+  const [cloudUrl, setCloudUrl] = useState<string>(''); // Left empty for relative API path (current host)
+  
   const [tempIp, setTempIp] = useState<string>('192.168.29.75');
+  const [tempCloudUrl, setTempCloudUrl] = useState<string>('');
+  
   const [showConfig, setShowConfig] = useState<boolean>(false);
   const [isDemoMode, setIsDemoMode] = useState<boolean>(false);
 
@@ -47,10 +54,21 @@ export default function Home() {
 
   // Load configuration and initialize logs
   useEffect(() => {
+    const savedMode = localStorage.getItem('esp32_connection_mode') as ConnectionMode;
+    if (savedMode === 'LAN' || savedMode === 'CLOUD') {
+      setConnectionMode(savedMode);
+    }
+
     const savedIp = localStorage.getItem('esp32_ip_address');
     if (savedIp) {
       setIpAddress(savedIp);
       setTempIp(savedIp);
+    }
+
+    const savedCloudUrl = localStorage.getItem('esp32_cloud_url');
+    if (savedCloudUrl) {
+      setCloudUrl(savedCloudUrl);
+      setTempCloudUrl(savedCloudUrl);
     }
     
     const savedDemo = localStorage.getItem('esp32_demo_mode');
@@ -62,7 +80,7 @@ export default function Home() {
   }, [addLog]);
 
   // Main status poller
-  const fetchStatus = useCallback(async (isInitial = false, targetIp = ipAddress, demo = isDemoMode) => {
+  const fetchStatus = useCallback(async (isInitial = false, targetMode = connectionMode, targetIp = ipAddress, targetCloud = cloudUrl, demo = isDemoMode) => {
     if (isActionPending) return; // Prevent poll overlap during user interaction
 
     if (isInitial) {
@@ -76,15 +94,25 @@ export default function Home() {
         setDeviceStatus(currentMockState);
         setIsLoading(false);
         if (isInitial) {
-          addLog(`[DEMO] Connected to simulated ESP32 at ${targetIp}. Status: ${currentMockState}`, 'success');
+          addLog(`[DEMO] Connected to simulated ESP32. Mode: ${targetMode}. Status: ${currentMockState}`, 'success');
         }
       }, 300);
       return;
     }
 
-    // Sanitize IP address / URL
-    const cleanIp = targetIp.trim().replace(/^https?:\/\//, '');
-    const url = `http://${cleanIp}/status`;
+    let url = '';
+    let logLabel = '';
+
+    if (targetMode === 'LAN') {
+      const cleanIp = targetIp.trim().replace(/^https?:\/\//, '');
+      url = `http://${cleanIp}/status`;
+      logLabel = `LAN (http://${cleanIp})`;
+    } else {
+      // CLOUD WAN Mode: if cloudUrl is empty, use relative server path, else absolute Vercel path
+      const base = targetCloud.trim();
+      url = base ? `${base}/api/control` : '/api/control';
+      logLabel = `Cloud (${base ? base : 'local backend'})`;
+    }
 
     try {
       const controller = new AbortController();
@@ -103,15 +131,32 @@ export default function Home() {
         throw new Error(`HTTP Error ${response.status}`);
       }
 
-      const text = (await response.text()).trim().toUpperCase();
-      
-      if (text === 'ON' || text === 'OFF') {
-        if (deviceStatus !== text || isInitial) {
-          addLog(`GET /status successful. Device is ${text}`, 'success');
+      if (targetMode === 'LAN') {
+        const text = (await response.text()).trim().toUpperCase();
+        if (text === 'ON' || text === 'OFF') {
+          if (deviceStatus !== text || isInitial) {
+            addLog(`GET /status successful via ${logLabel}. Device is ${text}`, 'success');
+          }
+          setDeviceStatus(text);
+        } else {
+          throw new Error(`Invalid response content: "${text.substring(0, 15)}"`);
         }
-        setDeviceStatus(text);
       } else {
-        throw new Error(`Invalid response content: "${text.substring(0, 15)}"`);
+        // CLOUD WAN Mode returns JSON
+        const data = await response.json();
+        const status = data.status?.toUpperCase() || 'ESP32 OFFLINE';
+        
+        if (status === 'ON' || status === 'OFF') {
+          if (deviceStatus !== status || isInitial) {
+            addLog(`GET /api/control successful. Node is online. Status: ${status}`, 'success');
+          }
+          setDeviceStatus(status);
+        } else {
+          if (deviceStatus !== 'ESP32 Offline' || isInitial) {
+            addLog(`Cloud Relay reports ESP32 is offline. Last seen: ${data.secondsSinceLastContact === -1 ? 'Never' : data.secondsSinceLastContact + 's ago'}`, 'warning');
+          }
+          setDeviceStatus('ESP32 Offline');
+        }
       }
     } catch (error: any) {
       let errorMsg = error?.message || 'Network request failed';
@@ -120,13 +165,13 @@ export default function Home() {
       }
       
       if (deviceStatus !== 'ESP32 Offline' || isInitial) {
-        addLog(`GET /status failed: ${errorMsg}. Device marked offline.`, 'error');
+        addLog(`Failed to query ${logLabel}: ${errorMsg}`, 'error');
       }
       setDeviceStatus('ESP32 Offline');
     } finally {
       setIsLoading(false);
     }
-  }, [ipAddress, isDemoMode, deviceStatus, isActionPending, addLog]);
+  }, [ipAddress, cloudUrl, connectionMode, isDemoMode, deviceStatus, isActionPending, addLog]);
 
   // Handle Poll Interval
   useEffect(() => {
@@ -140,22 +185,39 @@ export default function Home() {
     return () => clearInterval(interval);
   }, [fetchStatus]);
 
-  // Save IP config handler
+  // Change connection mode
+  const handleModeChange = (mode: ConnectionMode) => {
+    setConnectionMode(mode);
+    localStorage.setItem('esp32_connection_mode', mode);
+    addLog(`Switched network connection mode to: ${mode === 'LAN' ? 'Local LAN (Direct ESP32 IP)' : 'Global Cloud (Next.js server relay)'}`, 'info');
+    
+    setIsLoading(true);
+    fetchStatus(true, mode);
+  };
+
+  // Save Config handler
   const saveConfiguration = () => {
-    let sanitizedIp = tempIp.trim();
-    if (!sanitizedIp) {
-      addLog('Invalid IP address configuration.', 'warning');
-      return;
+    if (connectionMode === 'LAN') {
+      let sanitizedIp = tempIp.trim();
+      if (!sanitizedIp) {
+        addLog('Invalid LAN IP configuration.', 'warning');
+        return;
+      }
+      localStorage.setItem('esp32_ip_address', sanitizedIp);
+      setIpAddress(sanitizedIp);
+      addLog(`Local LAN IP host updated to: http://${sanitizedIp}`, 'info');
+    } else {
+      let sanitizedUrl = tempCloudUrl.trim().replace(/\/$/, ''); // Remove trailing slash
+      localStorage.setItem('esp32_cloud_url', sanitizedUrl);
+      setCloudUrl(sanitizedUrl);
+      addLog(`Global Cloud Host URL updated to: ${sanitizedUrl ? sanitizedUrl : 'relative local backend'}`, 'info');
     }
     
-    localStorage.setItem('esp32_ip_address', sanitizedIp);
-    setIpAddress(sanitizedIp);
     setShowConfig(false);
-    addLog(`Target ESP32 host updated to: http://${sanitizedIp}`, 'info');
     
     // Trigger immediate refresh with new settings
     setIsLoading(true);
-    fetchStatus(true, sanitizedIp);
+    fetchStatus(true);
   };
 
   // Toggle demo mode handler
@@ -167,14 +229,14 @@ export default function Home() {
       demoStateRef.current = deviceStatus === 'ESP32 Offline' ? 'OFF' : deviceStatus;
       addLog('Hardware Demo Mode enabled. Simulation active.', 'warning');
     } else {
-      addLog('Hardware Demo Mode disabled. Re-establishing live hardware connection...', 'info');
+      addLog('Hardware Demo Mode disabled. Re-establishing live physical connection...', 'info');
     }
     
     setIsLoading(true);
-    fetchStatus(true, ipAddress, checked);
+    fetchStatus(true, connectionMode, ipAddress, cloudUrl, checked);
   };
 
-  // Command control endpoint trigger (ON/OFF)
+  // Command control trigger (ON/OFF)
   const sendCommand = async (command: 'on' | 'off') => {
     const cmdUpper = command.toUpperCase();
     setIsActionPending(true);
@@ -190,40 +252,67 @@ export default function Home() {
       return;
     }
 
-    const cleanIp = ipAddress.trim().replace(/^https?:\/\//, '');
-    const url = `http://${cleanIp}/${command}`;
+    let url = '';
+    let fetchOptions: RequestInit = { method: 'GET', cache: 'no-store', mode: 'cors' };
+    let logLabel = '';
+
+    if (connectionMode === 'LAN') {
+      const cleanIp = ipAddress.trim().replace(/^https?:\/\//, '');
+      url = `http://${cleanIp}/${command}`;
+      logLabel = `LAN (http://${cleanIp}/${command})`;
+    } else {
+      // CLOUD WAN Mode: POST to API route
+      const base = cloudUrl.trim();
+      url = base ? `${base}/api/control` : '/api/control';
+      logLabel = `Cloud API (${url})`;
+      fetchOptions = {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ command: cmdUpper }),
+        cache: 'no-store',
+      };
+    }
 
     try {
       const controller = new AbortController();
       const id = setTimeout(() => controller.abort(), 3000); // 3s command timeout
+      fetchOptions.signal = controller.signal;
 
-      const response = await fetch(url, {
-        method: 'GET',
-        signal: controller.signal,
-        cache: 'no-store',
-        mode: 'cors'
-      });
-
+      const response = await fetch(url, fetchOptions);
       clearTimeout(id);
 
       if (!response.ok) {
         throw new Error(`HTTP Error ${response.status}`);
       }
 
-      const text = (await response.text()).trim().toUpperCase();
-      
-      if (text === 'ON' || text === 'OFF' || text === cmdUpper) {
-        setDeviceStatus(cmdUpper);
-        addLog(`Command success: http://${cleanIp}/${command} -> Device turned ${cmdUpper}`, 'success');
+      if (connectionMode === 'LAN') {
+        const text = (await response.text()).trim().toUpperCase();
+        if (text === 'ON' || text === 'OFF' || text === cmdUpper) {
+          setDeviceStatus(cmdUpper);
+          addLog(`Command success: ${logLabel} -> Device turned ${cmdUpper}`, 'success');
+        } else {
+          setDeviceStatus(cmdUpper);
+          addLog(`Command response unexpected ("${text.substring(0, 10)}"), but command succeeded. State: ${cmdUpper}`, 'warning');
+        }
       } else {
-        // Fallback: If device returns something else but call succeeded
-        setDeviceStatus(cmdUpper);
-        addLog(`Command response unexpected ("${text.substring(0, 10)}"), but command succeeded. Setting state ${cmdUpper}`, 'warning');
+        // CLOUD Mode response
+        const data = await response.json();
+        if (data.success) {
+          // Note: In Cloud Mode, the command is set as the DESIRED state on the server.
+          // The device status on the dashboard updates after the ESP32 fetches it and aligns physically.
+          // But to give responsive tactile feedback, we set state instantly and explain in logs.
+          setDeviceStatus(cmdUpper);
+          addLog(`Desired state updated to ${cmdUpper} on Cloud Relay. Synced on next ESP32 poll.`, 'success');
+        } else {
+          throw new Error(data.error || 'Server rejected command');
+        }
       }
     } catch (error: any) {
       const errorMsg = error?.message || 'Network connection failed';
-      addLog(`Failed to send command ${cmdUpper}: ${errorMsg}`, 'error');
-      // If we fail to send command, immediately recheck health
+      addLog(`Failed to send command ${cmdUpper} via ${connectionMode} Mode: ${errorMsg}`, 'error');
+      // If we fail, force status refresh
       fetchStatus(false);
     } finally {
       setIsActionPending(false);
@@ -235,8 +324,7 @@ export default function Home() {
     addLog('System event console logs cleared.', 'info');
   };
 
-  // Style helpers based on device status
-  const isOnline = deviceStatus === 'ON' || deviceStatus === 'OFF';
+  // Style helpers
   const isDeviceOn = deviceStatus === 'ON';
   const isOffline = deviceStatus === 'ESP32 Offline';
 
@@ -265,80 +353,150 @@ export default function Home() {
                 ESP32 Smart IoT Node
               </h1>
             </div>
-            <p className="text-xs text-slate-400 mt-1 flex items-center gap-1.5">
-              Target IP: 
-              <span className="font-mono bg-slate-900 px-1.5 py-0.5 rounded border border-slate-800 text-slate-300">
-                http://{ipAddress}
+            
+            {/* Dynamic IP info line */}
+            <p className="text-xs text-slate-400 mt-1.5 flex flex-wrap items-center gap-1.5">
+              Mode: 
+              <span className={`font-semibold uppercase tracking-wider text-[10px] px-1.5 py-0.5 rounded border ${
+                connectionMode === 'LAN' 
+                  ? 'bg-sky-950/40 border-sky-900/30 text-sky-400' 
+                  : 'bg-indigo-950/40 border-indigo-900/30 text-indigo-400'
+              }`}>
+                {connectionMode === 'LAN' ? 'Local LAN' : 'Global Cloud'}
               </span>
+              {connectionMode === 'LAN' ? (
+                <>
+                  Host: <span className="font-mono bg-slate-900 px-1.5 py-0.5 rounded border border-slate-800 text-slate-300">http://{ipAddress}</span>
+                </>
+              ) : (
+                <>
+                  Cloud API: <span className="font-mono bg-slate-900 px-1.5 py-0.5 rounded border border-slate-800 text-slate-300">{cloudUrl ? cloudUrl + '/api/control' : '/api/control'}</span>
+                </>
+              )}
               {isDemoMode && (
-                <span className="text-amber-400 font-semibold uppercase tracking-wider text-[10px] ml-1 bg-amber-950/40 px-1.5 py-0.5 rounded border border-amber-900/30">
-                  Demo Active
+                <span className="text-amber-400 font-semibold uppercase tracking-wider text-[10px] bg-amber-950/40 px-1.5 py-0.5 rounded border border-amber-900/30">
+                  Demo Mode
                 </span>
               )}
             </p>
           </div>
 
-          <div className="flex items-center gap-2">
-            {/* Simulation toggle */}
-            <label className="flex items-center gap-2 bg-slate-900/60 border border-slate-800 px-3 py-1.5 rounded-lg text-xs cursor-pointer hover:bg-slate-900 transition-colors">
-              <input
-                type="checkbox"
-                checked={isDemoMode}
-                onChange={(e) => toggleDemoMode(e.target.checked)}
-                className="rounded border-slate-800 text-cyan-600 focus:ring-cyan-500 focus:ring-offset-slate-950 bg-slate-950"
-              />
-              <span className="text-slate-300 select-none">Demo/Simulate Mode</span>
-            </label>
+          {/* Controls Right */}
+          <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto">
+            
+            {/* Connection Mode Toggle buttons (Sliding Pill style) */}
+            <div className="bg-slate-900 border border-slate-850 p-0.5 rounded-lg flex items-center shrink-0">
+              <button
+                onClick={() => handleModeChange('LAN')}
+                className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-all active:scale-95 ${
+                  connectionMode === 'LAN' 
+                    ? 'bg-slate-800 text-white shadow-sm' 
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                Local LAN
+              </button>
+              <button
+                onClick={() => handleModeChange('CLOUD')}
+                className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-all active:scale-95 ${
+                  connectionMode === 'CLOUD' 
+                    ? 'bg-cyan-600 text-slate-950 shadow-md shadow-cyan-950/20 font-bold' 
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                Cloud WAN
+              </button>
+            </div>
 
-            {/* Config Toggle button */}
-            <button
-              onClick={() => setShowConfig(!showConfig)}
-              id="btn-settings-toggle"
-              className="flex items-center justify-center p-2 rounded-lg bg-slate-900/60 border border-slate-800 text-slate-300 hover:text-white hover:bg-slate-900 hover:border-slate-700 transition-all active:scale-95"
-              aria-label="Toggle network settings"
-            >
-              <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
-              </svg>
-            </button>
+            <div className="flex items-center gap-2 ml-auto sm:ml-0">
+              {/* Simulation checkbox */}
+              <label className="flex items-center gap-2 bg-slate-900/60 border border-slate-800 px-3 py-2 rounded-lg text-xs cursor-pointer hover:bg-slate-900 transition-colors">
+                <input
+                  type="checkbox"
+                  checked={isDemoMode}
+                  onChange={(e) => toggleDemoMode(e.target.checked)}
+                  className="rounded border-slate-800 text-cyan-600 focus:ring-cyan-500 focus:ring-offset-slate-950 bg-slate-950"
+                />
+                <span className="text-slate-300 select-none hidden sm:inline">Simulate Mode</span>
+                <span className="text-slate-300 select-none sm:hidden">Sim</span>
+              </label>
+
+              {/* Settings toggle */}
+              <button
+                onClick={() => {
+                  setShowConfig(!showConfig);
+                  if (!showConfig) {
+                    setTempIp(ipAddress);
+                    setTempCloudUrl(cloudUrl);
+                  }
+                }}
+                id="btn-settings-toggle"
+                className="flex items-center justify-center p-2 h-[34px] w-[34px] rounded-lg bg-slate-900/60 border border-slate-800 text-slate-300 hover:text-white hover:bg-slate-900 hover:border-slate-700 transition-all active:scale-95"
+                aria-label="Toggle networks settings"
+              >
+                <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                </svg>
+              </button>
+            </div>
+
           </div>
         </header>
 
-        {/* IP Configurator Slide-down panel */}
+        {/* Dynamic IP/Cloud URL Configurator Slide-down panel */}
         {showConfig && (
-          <section className="bg-slate-900/60 border border-slate-800 rounded-xl p-4 flex flex-col sm:flex-row gap-3 items-end backdrop-blur-md animate-in fade-in slide-in-from-top-4 duration-200">
-            <div className="flex-1 w-full">
-              <label htmlFor="esp32-ip-input" className="block text-xs font-semibold uppercase tracking-wider text-slate-400 mb-1.5">
-                ESP32 IP Address / Hostname
-              </label>
-              <div className="relative">
-                <span className="absolute inset-y-0 left-0 flex items-center pl-3 text-slate-500 font-mono text-sm">
-                  http://
-                </span>
-                <input
-                  id="esp32-ip-input"
-                  type="text"
-                  value={tempIp}
-                  onChange={(e) => setTempIp(e.target.value)}
-                  placeholder="192.168.1.5"
-                  className="w-full bg-slate-950 border border-slate-800 rounded-lg py-2 pl-14 pr-3 text-sm text-slate-100 font-mono focus:outline-none focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500 transition-colors"
-                />
+          <section className="bg-slate-900/60 border border-slate-800 rounded-xl p-4 flex flex-col gap-3.5 backdrop-blur-md animate-in fade-in slide-in-from-top-4 duration-200">
+            {connectionMode === 'LAN' ? (
+              <div className="w-full">
+                <label htmlFor="esp32-ip-input" className="block text-xs font-semibold uppercase tracking-wider text-slate-400 mb-1.5">
+                  Local ESP32 IP Address
+                </label>
+                <div className="relative">
+                  <span className="absolute inset-y-0 left-0 flex items-center pl-3 text-slate-500 font-mono text-sm">
+                    http://
+                  </span>
+                  <input
+                    id="esp32-ip-input"
+                    type="text"
+                    value={tempIp}
+                    onChange={(e) => setTempIp(e.target.value)}
+                    placeholder="192.168.29.75"
+                    className="w-full bg-slate-950 border border-slate-800 rounded-lg py-2 pl-14 pr-3 text-sm text-slate-100 font-mono focus:outline-none focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500 transition-colors"
+                  />
+                </div>
+                <p className="text-[10px] text-slate-500 mt-1">Configure your ESP32 board local private IP assigned by your router (Wi-Fi LAN mode).</p>
               </div>
-            </div>
-            <div className="flex gap-2 w-full sm:w-auto">
+            ) : (
+              <div className="w-full">
+                <label htmlFor="esp32-cloud-input" className="block text-xs font-semibold uppercase tracking-wider text-slate-400 mb-1.5">
+                  Custom Next.js Cloud Base URL (Optional)
+                </label>
+                <input
+                  id="esp32-cloud-input"
+                  type="text"
+                  value={tempCloudUrl}
+                  onChange={(e) => setTempCloudUrl(e.target.value)}
+                  placeholder="https://my-esp32-nodes.vercel.app"
+                  className="w-full bg-slate-950 border border-slate-800 rounded-lg py-2 px-3 text-sm text-slate-100 font-mono focus:outline-none focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500 transition-colors"
+                />
+                <p className="text-[10px] text-slate-500 mt-1">Leave empty to use the current website host base url (standard relative query `/api/control`).</p>
+              </div>
+            )}
+            
+            <div className="flex gap-2 justify-end">
               <button
                 onClick={() => setShowConfig(false)}
-                className="flex-1 sm:flex-initial px-4 py-2 text-xs font-medium bg-slate-950 text-slate-400 hover:text-white border border-slate-850 hover:bg-slate-900 rounded-lg transition-colors active:scale-95"
+                className="px-4 py-2 text-xs font-medium bg-slate-950 text-slate-400 hover:text-white border border-slate-850 hover:bg-slate-900 rounded-lg transition-colors active:scale-95"
               >
                 Cancel
               </button>
               <button
                 onClick={saveConfiguration}
                 id="btn-save-ip"
-                className="flex-1 sm:flex-initial px-5 py-2 text-xs font-semibold bg-cyan-600 hover:bg-cyan-500 text-slate-950 rounded-lg transition-all shadow-md shadow-cyan-950/20 active:scale-95"
+                className="px-5 py-2 text-xs font-semibold bg-cyan-600 hover:bg-cyan-500 text-slate-950 rounded-lg transition-all shadow-md shadow-cyan-950/20 active:scale-95"
               >
-                Apply & Test
+                Apply & Refresh
               </button>
             </div>
           </section>
@@ -357,7 +515,9 @@ export default function Home() {
 
             {/* Top Indicator */}
             <div className="w-full flex justify-between items-center text-xs text-slate-400 border-b border-slate-850/60 pb-4 mb-4">
-              <span className="font-semibold uppercase tracking-wider text-[10px]">Physical Node Controller</span>
+              <span className="font-semibold uppercase tracking-wider text-[10px]">
+                {connectionMode === 'LAN' ? 'Direct Node Connection' : 'Global Cloud Routing'}
+              </span>
               <span className="flex items-center gap-1.5 font-mono">
                 {isLoading ? (
                   <>
@@ -369,8 +529,8 @@ export default function Home() {
                   </>
                 ) : (
                   <>
-                    <span className="inline-block w-1.5 h-1.5 rounded-full bg-emerald-500" />
-                    Connected
+                    <span className={`inline-block w-1.5 h-1.5 rounded-full ${isOffline ? 'bg-rose-500' : 'bg-emerald-500'}`} />
+                    {isOffline ? 'Disconnected' : 'Synchronized'}
                   </>
                 )}
               </span>
@@ -406,7 +566,7 @@ export default function Home() {
 
               {/* Status Text Description */}
               <div className="mt-5">
-                <span className="text-xs text-slate-500 uppercase tracking-widest font-semibold">Current State</span>
+                <span className="text-xs text-slate-500 uppercase tracking-widest font-semibold font-mono">Current State</span>
                 <h2 className={`text-3xl font-extrabold tracking-wide mt-1 transition-all duration-300 ${
                   isOffline 
                     ? 'text-rose-500 drop-shadow-[0_0_12px_rgba(239,68,68,0.25)]' 
@@ -420,13 +580,17 @@ export default function Home() {
             </div>
 
             {/* Bottom State Explanation */}
-            <div className="text-xs text-slate-400 border-t border-slate-850/60 pt-4 w-full">
+            <div className="text-xs text-slate-450 border-t border-slate-850/60 pt-4 w-full">
               {isOffline ? (
-                <span className="text-rose-400/80">Device is unreachable. Please verify power, local IP address config, or Wi-Fi status.</span>
+                <span className="text-rose-400/80">
+                  {connectionMode === 'LAN' 
+                    ? 'Check physical power on the ESP32 board or make sure your device is on the same local Wi-Fi.'
+                    : 'Cloud server is active, but the ESP32 is offline. Check if your micro-controller is powered and flashing.'}
+                </span>
               ) : isDeviceOn ? (
-                <span className="text-cyan-400/90 font-medium">Relay is active (GPIO2 HIGH). Powered circuit is currently closed/live.</span>
+                <span className="text-cyan-400/90 font-medium">Active (GPIO2 HIGH). Circuit load closed. Control active from anywhere.</span>
               ) : (
-                <span className="text-slate-400">Relay is dormant (GPIO2 LOW). Powered circuit is open/dormant.</span>
+                <span className="text-slate-400">Dormant (GPIO2 LOW). Circuit load open. Poller synchronizing.</span>
               )}
             </div>
 
@@ -444,12 +608,17 @@ export default function Home() {
                 IoT Control Panel
               </h3>
               <p className="text-xs text-slate-400 leading-relaxed">
-                Manually override the current physical device state using the buttons below. Fetch commands will be dispatched instantly to the micro-controller host.
+                {connectionMode === 'LAN' 
+                  ? 'Dispatches REST calls directly to the ESP32 internal webserver IP. Fast and local-only.' 
+                  : 'Updates the Desired State on the cloud backend. The ESP32 polls and applies it globally.'}
               </p>
               
-              <div className="mt-3 flex flex-wrap gap-1.5">
-                <span className="text-[10px] bg-slate-950 border border-slate-800 px-2 py-0.5 rounded text-slate-400 font-mono">GET /on</span>
-                <span className="text-[10px] bg-slate-950 border border-slate-800 px-2 py-0.5 rounded text-slate-400 font-mono">GET /off</span>
+              <div className="mt-3.5 flex flex-wrap gap-1.5">
+                <span className={`text-[10px] border px-2 py-0.5 rounded font-mono ${
+                  connectionMode === 'LAN' ? 'bg-sky-950/30 border-sky-900/30 text-sky-400' : 'bg-indigo-950/30 border-indigo-900/30 text-indigo-400'
+                }`}>
+                  {connectionMode === 'LAN' ? 'GET /on' : 'POST /api/control'}
+                </span>
                 <span className="text-[10px] bg-slate-950 border border-slate-800 px-2 py-0.5 rounded text-slate-400 font-mono">GPIO2</span>
               </div>
             </div>
@@ -466,7 +635,7 @@ export default function Home() {
                   isActionPending
                     ? 'bg-slate-850 text-slate-500 border border-slate-800 shadow-none cursor-not-allowed'
                     : isDeviceOn
-                      ? 'bg-cyan-500 hover:bg-cyan-400 text-slate-950 shadow-cyan-950/30'
+                      ? 'bg-cyan-500 hover:bg-cyan-400 text-slate-950 shadow-cyan-950/30 font-extrabold'
                       : 'bg-slate-900 border border-slate-800 text-cyan-400 hover:text-cyan-300 hover:bg-slate-850 hover:border-cyan-900/40 shadow-slate-950/20'
                 }`}
               >
@@ -483,8 +652,8 @@ export default function Home() {
                   isActionPending
                     ? 'bg-slate-850 text-slate-500 border border-slate-800 shadow-none cursor-not-allowed'
                     : !isDeviceOn && !isOffline
-                      ? 'bg-amber-500 hover:bg-amber-400 text-slate-950 shadow-amber-950/30'
-                      : 'bg-slate-900 border border-slate-800 text-slate-400 hover:text-rose-400 hover:bg-slate-850 hover:border-rose-900/30 shadow-slate-950/20'
+                      ? 'bg-amber-500 hover:bg-amber-400 text-slate-950 shadow-amber-950/30 font-extrabold'
+                      : 'bg-slate-900 border border-slate-800 text-slate-450 hover:text-rose-450 hover:bg-slate-850 hover:border-rose-900/30 shadow-slate-950/20'
                 }`}
               >
                 <span className={`w-2 h-2 rounded-full ${(!isDeviceOn && !isOffline) ? 'bg-slate-950 animate-ping' : 'bg-slate-500'}`} />
@@ -500,7 +669,7 @@ export default function Home() {
           
           {/* Console Header */}
           <div className="flex justify-between items-center bg-slate-950 px-4 py-3 border-b border-slate-850/80">
-            <div className="flex items-center gap-2 text-xs font-bold tracking-wide text-slate-300">
+            <div className="flex items-center gap-2 text-xs font-bold tracking-wide text-slate-350">
               <span className="flex h-2 w-2 relative">
                 <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-cyan-400 opacity-75"></span>
                 <span className="relative inline-flex rounded-full h-2 w-2 bg-cyan-500"></span>
@@ -509,7 +678,7 @@ export default function Home() {
             </div>
             <button
               onClick={clearLogs}
-              className="text-[10px] uppercase font-bold tracking-wider text-slate-400 hover:text-rose-400 transition-colors"
+              className="text-[10px] uppercase font-bold tracking-wider text-slate-400 hover:text-rose-450 transition-colors"
               title="Clear event logs"
             >
               Clear Logs
@@ -535,7 +704,7 @@ export default function Home() {
                         ? 'bg-rose-950/80 text-rose-400 border border-rose-900/40' 
                         : log.type === 'warning' 
                           ? 'bg-amber-950/80 text-amber-400 border border-amber-900/40'
-                          : 'bg-slate-900 text-slate-400 border border-slate-800'
+                          : 'bg-slate-900 text-slate-450 border border-slate-800'
                   }`}>
                     {log.type}
                   </span>
@@ -547,7 +716,7 @@ export default function Home() {
                         ? 'text-rose-400/90' 
                         : log.type === 'warning' 
                           ? 'text-amber-400/90'
-                          : 'text-slate-300'
+                          : 'text-slate-350'
                   }`}>
                     {log.message}
                   </span>
@@ -560,7 +729,7 @@ export default function Home() {
       </main>
 
       {/* Sleek Minimal Footer */}
-      <footer className="w-full border-t border-slate-900 py-4 text-center text-[10px] text-slate-600 font-mono z-10 bg-slate-950/80 backdrop-blur-sm">
+      <footer className="w-full border-t border-slate-900 py-4 text-center text-[10px] text-slate-650 font-mono z-10 bg-slate-950/80 backdrop-blur-sm">
         Next.js + ESP32 Smart Home Interface • Powered by Antigravity AI
       </footer>
 
